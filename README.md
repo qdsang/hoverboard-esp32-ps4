@@ -3,8 +3,10 @@ Hoverboard esp32 ps4 DIY
 
 # Pairing the PS4 Controller 
 
-https://github.com/xman4242/PS4-ESP32-Bluetooth#pairing-the-ps4-controller
-https://www.youtube.com/watch?v=dRysvxQfVDw&t=301s
+PS4-ESP32-Bluetooth#pairing-the-ps4-controller  
+https://github.com/xman4242/PS4-ESP32-Bluetooth#pairing-the-ps4-controller  
+  
+https://www.youtube.com/watch?v=dRysvxQfVDw&t=301s  
 
 
 
