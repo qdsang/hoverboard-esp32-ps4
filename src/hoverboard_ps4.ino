@@ -207,7 +207,8 @@ void initPS4() {
   PS4.attachOnDisconnect(onDisConnect);
 
   // https://github.com/xman4242/PS4-ESP32-Bluetooth#pairing-the-ps4-controller
-  bool isOK = PS4.begin("3c:71:bf:d1:a0:a2");
+  // bool isOK = PS4.begin("3c:71:bf:d1:a0:a2");
+  bool isOK = PS4.begin("3c:22:fb:57:55:fc");
   Serial.printf("initPS4: %d\n", isOK);
 }
 
@@ -238,14 +239,6 @@ void Send(int16_t uSteer, int16_t uSpeed)
 
   // Write to Serial
   HoverSerial.write((uint8_t *) &Command, sizeof(Command));
-
-  //Only needed to print the message properly on serial monitor. Else we dont need it.
-  if (millis() - lastTimeStamp > 100)
-  {
-    // Serial.println(messageString);
-    Serial.printf("%d mode: %d \t state: %d \t %d\n", heartbeat_time, ctrl_mode, uSteer, uSpeed);   
-    lastTimeStamp = millis();
-  }
 
   heartbeat_time = millis();
 }
@@ -320,11 +313,25 @@ void loop(void)
   // Check for new received data
   Receive();
 
-  if ((millis() - heartbeat_time) >= heartbeat_interval) {
-    Send(0, 0);
-    Serial.println("heartbeat Timeout!");
+  uint8_t println = 0;
+  //Only needed to print the message properly on serial monitor. Else we dont need it.
+  if (timeNow - lastTimeStamp > 100)
+  {
+    // Serial.println(messageString);
+    Serial.printf("[STATS] %d mode: %d \t steer: %d \t speed:%d", heartbeat_time, ctrl_mode, Command.steer, Command.speed);   
+    lastTimeStamp = millis();
+    println = 1;
   }
 
+  if ((millis() - heartbeat_time) >= heartbeat_interval) {
+    Send(0, 0);
+    Serial.print("[heartbeat] Timeout! ");
+    println = 1;
+  }
+
+  if (println)
+    Serial.println();
+  
   // Blink the LED
   digitalWrite(LED_BUILTIN, (timeNow%2000)<1000);
 }
