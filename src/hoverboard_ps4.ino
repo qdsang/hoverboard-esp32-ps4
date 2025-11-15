@@ -33,6 +33,8 @@
 #define SPEED_STEP          20          // [-] Speed step
 // #define DEBUG_RX                        // [-] Debug received data. Prints all bytes to serial (comment-out to disable)
 
+#define PS4_MAC_ADDRESS  "3c:22:fb:57:55:fc"
+
 // https://github.com/xman4242/PS4-ESP32-Bluetooth
 #include <PS4Controller.h>
 #include "esp_bt_main.h"
@@ -41,6 +43,12 @@
 #include "esp_err.h"
 #include <iostream>
 #include <sstream>
+
+#if CONFIG_IDF_TARGET_ESP32C3
+#include <SoftwareSerial.h>
+static const int Serial2RXPin = 9, Serial2TXPin = 10;
+SoftwareSerial Serial2(Serial2RXPin, Serial2TXPin);
+#endif
 
 #define HoverSerial Serial2        // RX 16, TX 17
 
@@ -102,7 +110,14 @@ void printDeviceAddress()
 }
 
 uint8_t ctrl_mode;
-uint8_t ctrl_mode_button = 0;
+float speedCoef = 1.0;
+float steerCoef = 1.0;
+
+bool ps4_Touchpad_pressed = false;
+bool ps4_Triangle_pressed = false;
+bool ps4_Cross_pressed = false;
+bool ps4_Circle_pressed = false;
+bool ps4_Square_pressed = false;
 
 void setPS4CtrlMode(uint8_t mode) {
   ctrl_mode = mode;
@@ -124,6 +139,7 @@ void setPS4CtrlMode(uint8_t mode) {
   Serial.println(ctrl_mode);
 }
 
+// 7ms update loop
 void notify()
 {
   char messageString[200];
@@ -153,39 +169,95 @@ void notify()
   PS4.Mic(),
   PS4.Battery());
 
-  if (ctrl_mode_button == 0 && PS4.Touchpad()) {
+  if (PS4.Touchpad() && !ps4_Touchpad_pressed) {
+    ps4_Touchpad_pressed = true;
     setPS4CtrlMode(ctrl_mode+1);
-    ctrl_mode_button = 1;
+  } else if (!PS4.Touchpad()) {
+    ps4_Touchpad_pressed = false;
   }
-  if (ctrl_mode_button == 1 && !PS4.Touchpad()) {
-    ctrl_mode_button = 0;
+
+  if (PS4.Triangle() && !ps4_Triangle_pressed) {
+    ps4_Triangle_pressed = true;
+    speedCoef += 0.1;
+    if (speedCoef > 2) {
+      speedCoef = 2;
+    }
+  } else if (!PS4.Triangle()) {
+    ps4_Triangle_pressed = false;
+  }
+
+  if (PS4.Cross() && !ps4_Cross_pressed) {
+    ps4_Cross_pressed = true;
+    speedCoef -= 0.1;
+    if (speedCoef < 0.1) {
+      speedCoef = 0.1;
+    }
+  } else if (!PS4.Cross()) {
+    ps4_Cross_pressed = false;
+  }
+
+  if (PS4.Circle() && !ps4_Circle_pressed) {
+    ps4_Circle_pressed = true;
+    steerCoef += 0.1;
+    if (steerCoef > 2) {
+      steerCoef = 2;
+    }
+  } else if (!PS4.Circle()) {
+    ps4_Circle_pressed = false;
+  }
+  if (PS4.Square() && !ps4_Square_pressed) {
+    ps4_Square_pressed = true;
+    steerCoef -= 0.1;
+    if (steerCoef < 0.1) {
+      steerCoef = 0.1;
+    }
+  } else if (!PS4.Square()) {
+    ps4_Square_pressed = false;
   }
 
   int16_t uSteer;
   int16_t uSpeed;
   if (ctrl_mode == 3) {
-    uSteer = PS4.L2Value();
-    uSpeed = PS4.R2Value();
-    uSteer = map(uSteer, -255, 255, -500, 500);
-    uSpeed = map(uSpeed, -255, 255, -500, 500);
+    int16_t l2 = PS4.L2Value();
+    int16_t r2 = PS4.R2Value();
+    uSteer = map(abs(l2 - r2), 0, 255, 0, 500) * ((l2 > r2) ? -1 : 1);
+    if (abs(l2) > 10 && abs(r2) > 10) {
+      uSpeed = -map(max(l2, r2), 0, 255, 0, 500);
+    } else {
+      uSpeed = 0;
+    }
   } else if (ctrl_mode == 2) {
     uSteer = PS4.LStickX();
     uSpeed = PS4.LStickY();
-    uSteer = map(uSteer, -255, 255, -500, 500);
-    uSpeed = map(uSpeed, -255, 255, -500, 500);
+    uSteer = map(uSteer, -128, 128, -500, 500);
+    uSpeed = -map(uSpeed, -128, 128, -500, 500);
   } else {
-    uSteer = PS4.LStickX();
-    uSpeed = PS4.RStickY();
-    uSteer = map(uSteer, -255, 255, -500, 500);
-    uSpeed = map(uSpeed, -255, 255, -500, 500);
+    uSteer = PS4.RStickX();
+    uSpeed = PS4.LStickY();
+    uSteer = map(uSteer, -128, 128, -500, 500);
+    uSpeed = -map(uSpeed, -128, 128, -500, 500);
   }
 
-  if (abs(uSteer) < 4) {
+  if (abs(uSteer) < 10) {
     uSteer = 0;
   }
-  if (abs(uSpeed) < 4) {
+  if (abs(uSpeed) < 10) {
     uSpeed = 0;
   }
+
+  if (uSteer == 0 && uSpeed == 0) {
+    int16_t l2 = PS4.L2Value();
+    int16_t r2 = PS4.R2Value();
+    uSteer = map(abs(l2 - r2), 0, 255, 0, 500) * ((l2 > r2) ? -1 : 1);
+    if (abs(l2) > 10 && abs(r2) > 10) {
+      uSpeed = -map(max(l2, r2), 0, 255, 0, 500);
+    } else {
+      uSpeed = 0;
+    }
+  }
+
+  uSteer = uSteer * steerCoef;
+  uSpeed = uSpeed * speedCoef;
 
   Send(uSteer, uSpeed);
 }
@@ -208,7 +280,7 @@ void initPS4() {
 
   // https://github.com/xman4242/PS4-ESP32-Bluetooth#pairing-the-ps4-controller
   // bool isOK = PS4.begin("3c:71:bf:d1:a0:a2");
-  bool isOK = PS4.begin("3c:22:fb:57:55:fc");
+  bool isOK = PS4.begin(PS4_MAC_ADDRESS);
   Serial.printf("initPS4: %d\n", isOK);
 }
 
@@ -218,14 +290,16 @@ void setup()
   Serial.begin(SERIAL_BAUD);
   Serial.println("Hoverboard Serial v1.0");
 
-  HoverSerial.begin(HOVER_SERIAL_BAUD);
-
   initPS4();
   printDeviceAddress();
+  delay(1500);
 
+  HoverSerial.begin(HOVER_SERIAL_BAUD);
   heartbeat_interval = 200;
+  delay(500);
 
   pinMode(LED_BUILTIN, OUTPUT);
+  delay(1000);
 }
 
 // ########################## SEND ##########################
@@ -241,6 +315,8 @@ void Send(int16_t uSteer, int16_t uSpeed)
   HoverSerial.write((uint8_t *) &Command, sizeof(Command));
 
   heartbeat_time = millis();
+  // Serial.printf("[STATS2] %d mode: %d \t steer: %d \t speed:%d\n", heartbeat_time, ctrl_mode, Command.steer, Command.speed);   
+
 }
 
 // ########################## RECEIVE ##########################

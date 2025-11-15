@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "*.bak": "cpp",
+        "sstream": "cpp"
+    }
+}
