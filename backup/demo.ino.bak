@@ -1,0 +1,17 @@
+#include <ESP.h>
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Get the size of the flash memory
+  uint32_t flash_size = ESP.getFlashChipSize();
+  
+  Serial.print("Flash size: ");
+  Serial.print(flash_size);
+  Serial.println(" bytes");
+}
+
+void loop() {
+  // Do nothing
+}

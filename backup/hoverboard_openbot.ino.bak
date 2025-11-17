@@ -1,0 +1,516 @@
+// *******************************************************************
+//  Arduino Nano 5V example code
+//  for   https://github.com/EmanuelFeru/hoverboard-firmware-hack-FOC
+//
+//  Copyright (C) 2019-2020 Emanuel FERU <aerdronix@gmail.com>
+//
+// *******************************************************************
+// INFO:
+// • This sketch uses the the Serial Software interface to communicate and send commands to the hoverboard
+// • The built-in (HW) Serial interface is used for debugging and visualization. In case the debugging is not needed,
+//   it is recommended to use the built-in Serial interface for full speed perfomace.
+// • The data packaging includes a Start Frame, checksum, and re-syncronization capability for reliable communication
+// 
+// The code starts with zero speed and moves towards +
+//
+// CONFIGURATION on the hoverboard side in config.h:
+// • Option 1: Serial on Right Sensor cable (short wired cable) - recommended, since the USART3 pins are 5V tolerant.
+//   #define CONTROL_SERIAL_USART3
+//   #define FEEDBACK_SERIAL_USART3
+//   // #define DEBUG_SERIAL_USART3
+// • Option 2: Serial on Left Sensor cable (long wired cable) - use only with 3.3V devices! The USART2 pins are not 5V tolerant!
+//   #define CONTROL_SERIAL_USART2
+//   #define FEEDBACK_SERIAL_USART2
+//   // #define DEBUG_SERIAL_USART2
+// *******************************************************************
+
+#include <Arduino.h>
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_err.h"
+#include <iostream>
+#include <sstream>
+
+
+// ########################## DEFINES ##########################
+#define HOVER_SERIAL_BAUD   115200      // [-] Baud rate for HoverSerial (used to communicate with the hoverboard)
+#define SERIAL_BAUD         115200      // [-] Baud rate for built-in Serial (used for the Serial Monitor)
+#define START_FRAME         0xABCD     	// [-] Start frme definition for reliable serial communication
+#define TIME_SEND           100         // [ms] Sending time interval
+#define SPEED_MAX_TEST      300         // [-] Maximum speed for testing
+#define SPEED_STEP          20          // [-] Speed step
+// #define DEBUG_RX                        // [-] Debug received data. Prints all bytes to serial (comment-out to disable)
+
+#define HoverSerial Serial2        // RX, TX
+
+// Global variables
+uint8_t idx = 0;                        // Index for new data pointer
+uint16_t bufStartFrame;                 // Buffer Start Frame
+byte *p;                                // Pointer declaration for the new received data
+byte incomingByte;
+byte incomingBytePrev;
+
+typedef struct{
+   uint16_t start;
+   int16_t  steer;
+   int16_t  speed;
+   uint16_t checksum;
+} SerialCommand;
+SerialCommand Command;
+
+typedef struct{
+   uint16_t start;
+   int16_t  cmd1;
+   int16_t  cmd2;
+   int16_t  speedR_meas;
+   int16_t  speedL_meas;
+   int16_t  batVoltage;
+   int16_t  boardTemp;
+   uint16_t cmdLed;
+   uint16_t checksum;
+} SerialFeedback;
+SerialFeedback Feedback;
+SerialFeedback NewFeedback;
+
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+BLEServer *bleServer = NULL;
+BLECharacteristic *pTxCharacteristic;
+BLECharacteristic *pRxCharacteristic;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+const char *SERVICE_UUID = "61653dc3-4021-4d1e-ba83-8b4eec61d613";  // UART service UUID
+const char *CHARACTERISTIC_UUID_RX = "06386c14-86ea-4d71-811c-48f97c58f8c9";
+const char *CHARACTERISTIC_UUID_TX = "9bf1103b-834c-47cf-b149-c9e4bcf778a7";
+
+const String robot_type = "HoverBoard";
+
+//Heartbeat
+unsigned long heartbeat_interval = -1;
+unsigned long heartbeat_time = 0;
+
+unsigned long lastTimeStamp = 0;
+
+
+#define HAS_VOLTAGE_DIVIDER 1
+#define HAS_SPEED_SENSORS_FRONT 1
+
+#if (HAS_VOLTAGE_DIVIDER)
+unsigned long voltage_interval = 1000;  //Interval for sending voltage measurements
+unsigned long voltage_time = 0;
+#endif
+
+unsigned long wheel_interval = 1000;  // Interval for sending wheel odometry
+unsigned long wheel_time = 0;
+
+
+enum msgParts {
+  HEADER,
+  BODY
+};
+
+msgParts msgPart = HEADER;
+char header;
+char endChar = '\n';
+const char MAX_MSG_SZ = 60;
+char msg_buf[MAX_MSG_SZ] = "";
+int msg_idx = 0;
+
+void process_header(char inChar) {
+  header = inChar;
+  msgPart = BODY;
+}
+
+void process_body(char inChar) {
+  // Add the incoming byte to the buffer
+  msg_buf[msg_idx] = inChar;
+  msg_idx++;
+}
+
+void process_ctrl_msg() {
+  int16_t uSteer;
+  int16_t uSpeed;
+  char *tmp;                    // this is used by strtok() as an index
+  tmp = strtok(msg_buf, ",:");  // replace delimiter with \0
+  uSteer = atoi(tmp);        // convert to int
+  tmp = strtok(NULL, ",:");     // continues where the previous call left off
+  uSpeed = atoi(tmp);       // convert to int
+
+  Send(uSteer, uSpeed);
+
+#if DEBUG
+  Serial.print("Control: ");
+  Serial.print(uSteer);
+  Serial.print(",");
+  Serial.println(uSpeed);
+#endif
+}
+
+void process_heartbeat_msg() {
+  heartbeat_interval = atol(msg_buf);  // convert to long
+  heartbeat_time = millis();
+#if DEBUG
+  Serial.print("Heartbeat Interval: ");
+  Serial.println(heartbeat_interval);
+#endif
+}
+
+void sendData(String data) {
+  Serial.print("BLE data: ");
+  Serial.println(data);
+
+  if (deviceConnected) {
+    char outData[MAX_MSG_SZ] = "";
+    for (int i = 0; i < data.length(); i++) {
+      outData[i] = data[i];
+    }
+    pTxCharacteristic->setValue(outData);
+    pTxCharacteristic->notify();
+  }
+}
+
+#if (HAS_SPEED_SENSORS_FRONT or HAS_SPEED_SENSORS_BACK or HAS_SPEED_SENSORS_MIDDLE)
+void send_wheel_reading(long duration) {
+  // float rpm_factor = 60.0 * 1000.0 / duration / TICKS_PER_REV;
+  float rpm_left = Feedback.speedL_meas;
+  float rpm_right = Feedback.speedR_meas;
+  sendData("w" + String(rpm_left) + "," + String(rpm_right));
+}
+#endif
+
+void process_feature_msg() {
+  String msg = "f" + robot_type + ":";
+#if HAS_VOLTAGE_DIVIDER
+  msg += "v:";
+#endif
+#if HAS_INDICATORS
+  msg += "i:";
+#endif
+#if HAS_SONAR
+  msg += "s:";
+#endif
+#if HAS_BUMPER
+  msg += "b:";
+#endif
+#if HAS_SPEED_SENSORS_FRONT
+  msg += "wf:";
+#endif
+#if HAS_SPEED_SENSORS_BACK
+  msg += "wb:";
+#endif
+#if HAS_SPEED_SENSORS_MIDDLE
+  msg += "wm:";
+#endif
+#if HAS_LEDS_FRONT
+  msg += "lf:";
+#endif
+#if HAS_LEDS_BACK
+  msg += "lb:";
+#endif
+#if HAS_LEDS_STATUS
+  msg += "ls:";
+#endif
+  sendData(msg);
+}
+
+void process_voltage_msg() {
+#if HAS_VOLTAGE_DIVIDER
+  voltage_interval = atol(msg_buf);  // convert to long
+#endif
+}
+
+#if (HAS_SPEED_SENSORS_FRONT or HAS_SPEED_SENSORS_BACK or HAS_SPEED_SENSORS_MIDDLE)
+void process_wheel_msg() {
+  wheel_interval = atol(msg_buf);  // convert to long
+}
+#endif
+
+#if (HAS_VOLTAGE_DIVIDER)
+void send_voltage_reading() {
+  sendData("v" + String(Feedback.batVoltage, 2));
+}
+#endif
+
+void parse_msg() {
+  switch (header) {
+#if HAS_BUMPER
+    case 'b':
+      process_bumper_msg();
+      break;
+#endif
+    case 'c':
+      process_ctrl_msg();
+      break;
+    case 'f':
+      process_feature_msg();
+      break;
+    case 'h':
+      process_heartbeat_msg();
+      break;
+#if HAS_INDICATORS
+    case 'i':
+      process_indicator_msg();
+      break;
+#endif
+#if (HAS_LEDS_FRONT || HAS_LEDS_BACK)
+    case 'l':
+      process_light_msg();
+      break;
+#endif
+#if HAS_LEDS_STATUS
+    case 'n':
+      process_notification_msg();
+      break;
+#endif
+#if HAS_SONAR
+    case 's':
+      process_sonar_msg();
+      break;
+#endif
+#if HAS_VOLTAGE_DIVIDER
+    case 'v':
+      process_voltage_msg();
+      break;
+#endif
+#if (HAS_SPEED_SENSORS_FRONT or HAS_SPEED_SENSORS_BACK or HAS_SPEED_SENSORS_MIDDLE)
+    case 'w':
+      process_wheel_msg();
+      break;
+#endif
+  }
+  msg_idx = 0;
+  msgPart = HEADER;
+  header = '\0';
+}
+
+void on_ble_rx(char inChar) {
+  if (inChar != endChar) {
+    switch (msgPart) {
+      case HEADER:
+        process_header(inChar);
+        return;
+      case BODY:
+        process_body(inChar);
+        return;
+    }
+  } else {
+    msg_buf[msg_idx] = '\0';  // end of message
+    parse_msg();
+  }
+}
+
+//Initialization of classes for bluetooth
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *bleServer, esp_ble_gatts_cb_param_t *param) {
+    deviceConnected = true;
+
+    // // Set the preferred connection parameters
+    // uint16_t minInterval = 0; // Minimum connection interval in 1.25 ms units (50 ms)
+    // uint16_t maxInterval = 800; // Maximum connection interval in 1.25 ms units (1000 ms)
+    // uint16_t latency = 0;       // Slave latency
+    // uint16_t timeout = 5000;     // Supervision timeout in 10 ms units (50 seconds)
+
+    // bleServer->updateConnParams(param->connect.remote_bda, minInterval, maxInterval, latency, timeout);
+
+    Serial.println("BT Connected");
+  };
+
+  void onDisconnect(BLEServer *bleServer) {
+    deviceConnected = false;
+    Serial.println("BT Disconnected");
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string bleReceiver = pCharacteristic->getValue();
+    if (bleReceiver.length() > 0) {
+      for (int i = 0; i < bleReceiver.length(); i++) {
+        on_ble_rx(bleReceiver[i]);
+      }
+    }
+  }
+};
+
+
+
+// ########################## SETUP ##########################
+void setup() 
+{
+  Serial.begin(SERIAL_BAUD);
+  Serial.println("Hoverboard Serial v1.0");
+
+  HoverSerial.begin(HOVER_SERIAL_BAUD);
+
+  String ble_name = "OpenBot: " + robot_type;
+  BLEDevice::init(ble_name.c_str());
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = bleServer->createService(BLEUUID(SERVICE_UUID));
+
+  pTxCharacteristic = pService->createCharacteristic(BLEUUID(CHARACTERISTIC_UUID_TX), BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  pRxCharacteristic = pService->createCharacteristic(BLEUUID(CHARACTERISTIC_UUID_RX), BLECharacteristic::PROPERTY_WRITE_NR);
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+  pRxCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID));
+  bleServer->getAdvertising()->start();
+  Serial.println("Waiting a client connection to notify...");
+
+  pinMode(LED_BUILTIN, OUTPUT);
+}
+
+// ########################## SEND ##########################
+void Send(int16_t uSteer, int16_t uSpeed)
+{
+  // Create command
+  Command.start    = (uint16_t)START_FRAME;
+  Command.steer    = (int16_t)uSteer;
+  Command.speed    = (int16_t)uSpeed;
+  Command.checksum = (uint16_t)(Command.start ^ Command.steer ^ Command.speed);
+
+  // Write to Serial
+  HoverSerial.write((uint8_t *) &Command, sizeof(Command)); 
+
+  //Only needed to print the message properly on serial monitor. Else we dont need it.
+  if (millis() - lastTimeStamp > 100)
+  {
+    // Serial.println(messageString);
+    Serial.printf("%d \t state: %d \t %d\n", heartbeat_time, uSteer, uSpeed);   
+    lastTimeStamp = millis();
+  }
+}
+
+// ########################## RECEIVE ##########################
+void Receive()
+{
+    // Check for new data availability in the Serial buffer
+    if (HoverSerial.available()) {
+        incomingByte 	  = HoverSerial.read();                                   // Read the incoming byte
+        bufStartFrame	= ((uint16_t)(incomingByte) << 8) | incomingBytePrev;       // Construct the start frame
+    }
+    else {
+        return;
+    }
+
+  // If DEBUG_RX is defined print all incoming bytes
+  #ifdef DEBUG_RX
+        Serial.print(incomingByte);
+        return;
+    #endif
+
+    // Copy received data
+    if (bufStartFrame == START_FRAME) {	                    // Initialize if new data is detected
+        p       = (byte *)&NewFeedback;
+        *p++    = incomingBytePrev;
+        *p++    = incomingByte;
+        idx     = 2;	
+    } else if (idx >= 2 && idx < sizeof(SerialFeedback)) {  // Save the new received data
+        *p++    = incomingByte; 
+        idx++;
+    }	
+    
+    // Check if we reached the end of the package
+    if (idx == sizeof(SerialFeedback)) {
+        uint16_t checksum;
+        checksum = (uint16_t)(NewFeedback.start ^ NewFeedback.cmd1 ^ NewFeedback.cmd2 ^ NewFeedback.speedR_meas ^ NewFeedback.speedL_meas
+                            ^ NewFeedback.batVoltage ^ NewFeedback.boardTemp ^ NewFeedback.cmdLed);
+
+        // Check validity of the new data
+        if (NewFeedback.start == START_FRAME && checksum == NewFeedback.checksum) {
+            // Copy the new data
+            memcpy(&Feedback, &NewFeedback, sizeof(SerialFeedback));
+
+            // Print data to built-in Serial
+            Serial.print("1: ");   Serial.print(Feedback.cmd1);
+            Serial.print(" 2: ");  Serial.print(Feedback.cmd2);
+            Serial.print(" 3: ");  Serial.print(Feedback.speedR_meas);
+            Serial.print(" 4: ");  Serial.print(Feedback.speedL_meas);
+            Serial.print(" 5: ");  Serial.print(Feedback.batVoltage);
+            Serial.print(" 6: ");  Serial.print(Feedback.boardTemp);
+            Serial.print(" 7: ");  Serial.println(Feedback.cmdLed);
+        } else {
+          Serial.println("Non-valid data skipped");
+        }
+        idx = 0;    // Reset the index (it prevents to enter in this if condition in the next cycle)
+    }
+
+    // Update previous states
+    incomingBytePrev = incomingByte;
+}
+
+// ########################## LOOP ##########################
+
+// unsigned long iTimeSend = 0;
+// int iTest = 0;
+// int iStep = SPEED_STEP;
+
+void loop(void)
+{ 
+  unsigned long timeNow = millis();
+
+  // Check for new received data
+  Receive();
+
+  // if ((millis() - heartbeat_time) >= heartbeat_interval) {
+  //   Send(0, 0);
+  // }
+
+  // disconnecting
+  if (!deviceConnected && oldDeviceConnected) {
+    Send(0, 0);
+
+    delay(500);                     // give the bluetooth stack the chance to get things ready
+    bleServer->startAdvertising();  // restart advertising
+    Serial.println("Waiting a client connection to notify...");
+    oldDeviceConnected = deviceConnected;
+  }
+  // connecting
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+
+
+#if HAS_VOLTAGE_DIVIDER
+  // Send voltage reading via serial
+  if ((millis() - voltage_time) >= voltage_interval) {
+    send_voltage_reading();
+    voltage_time = millis();
+  }
+#endif
+#if (HAS_SPEED_SENSORS_FRONT or HAS_SPEED_SENSORS_BACK or HAS_SPEED_SENSORS_MIDDLE)
+  // Send wheel odometry reading via serial
+  if ((millis() - wheel_time) >= wheel_interval) {
+    send_wheel_reading(millis() - wheel_time);
+    wheel_time = millis();
+  }
+#endif
+
+  // // Send commands
+  // if (iTimeSend > timeNow) return;
+  // iTimeSend = timeNow + TIME_SEND;
+  // Send(0, iTest);
+
+  // // Calculate test command signal
+  // iTest += iStep;
+
+  // // invert step if reaching limit
+  // if (iTest >= SPEED_MAX_TEST || iTest <= -SPEED_MAX_TEST)
+  //   iStep = -iStep;
+
+  // Blink the LED
+  digitalWrite(LED_BUILTIN, (timeNow%2000)<1000);
+}
+
+// ########################## END ##########################

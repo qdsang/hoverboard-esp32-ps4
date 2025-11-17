@@ -1,0 +1,20 @@
+
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_err.h"
+#include <iostream>
+#include <sstream>
+
+void setup() 
+{
+  Serial.begin(115200);
+}
+
+uint32_t i = 0;
+void loop(void)
+{
+  i++;
+  Serial.printf("Timeout! %d \n", i);
+  delay(100);
+}

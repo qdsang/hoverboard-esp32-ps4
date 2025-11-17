@@ -1,0 +1,221 @@
+/*
+    Based on Neil Kolban example for IDF: https://github.com/nkolban/esp32-snippets/blob/master/cpp_utils/tests/BLE%20Tests/SampleWrite.cpp
+    Ported to Arduino ESP32 by Evandro Copercini
+*/
+
+// https://github.com/Ardumower/Sunray/blob/2a3500aac119ed47a2d63436b60a37e01864f5b5/esp32_ble/esp32_ble.ino#L152
+
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+
+// See the following for generating UUIDs:
+// https://www.uuidgenerator.net/
+
+#define CONSOLE Serial
+ 
+#define BLE_NAME "HoverBoard" //must match filters name in bluetoothterminal.js- navigator.bluetooth.requestDevice
+//#define SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e" //- must match optional services on navigator.bluetooth.requestDevice
+//#define CHARACTERISTIC_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+//maintain compatability with HM-10
+BLEUUID   SERVICE_UUID((uint16_t)0xFFE0); // UART service UUID
+BLEUUID   CHARACTERISTIC_UUID ((uint16_t)0xFFE1);
+
+BLEServer *pServer = NULL;
+BLECharacteristic * pCharacteristic;
+
+#define BLE_BUF_SZ 2048
+#define BLE_MTU 20   // max. transfer bytes per BLE frame
+
+bool bleConnected = false;
+bool oldBleConnected = false;
+
+volatile int txReadPos = 0;
+volatile int txWritePos = 0;
+byte txBuf[BLE_BUF_SZ];
+String notifyData;
+
+
+/*
+ * 
+ navigator.bluetooth.requestDevice({  
+  filters: [{
+      name: 'ESP32'
+    }],
+    optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+    '6e400002-b5a3-f393-e0a9-e50e24dcca9e',
+    '6e400003-b5a3-f393-e0a9-e50e24dcca9e']
+  });
+*/
+
+
+void DebugPrintHex(String title, String data) {
+  Serial.print(millis());
+  Serial.print(" " + title + ":");
+  for (int i = 0; i < data.length(); i++) {
+    byte c = data.charAt(i);
+    if (c < 0x10) {
+      Serial.print(" 0");
+    } else {
+      Serial.print(" ");
+    }
+    Serial.print(c, HEX);
+  }
+  Serial.println("");
+}
+
+void bleSend2(String notifyData) {
+  if (!bleConnected) {
+    // Serial.println("bleSend ignoring: not connected");
+    return;
+  }
+  if (notifyData.length() > 0){
+    DebugPrintHex("BLE tx", notifyData);
+
+    pCharacteristic->setValue( (uint8_t*) notifyData.c_str(), notifyData.length() );
+    pCharacteristic->notify();         
+  }
+}
+
+// send BLE data to BLE client (write data to FIFO)
+void bleSend(String s) {
+  if (!bleConnected) {
+    // CONSOLE.println("bleSend ignoring: not connected");
+    return;
+  }
+  for (int i = 0; i < s.length(); i++) {
+    if ( ((txWritePos + 1) % BLE_BUF_SZ) == txReadPos) {
+      CONSOLE.println("BLE: txBuf overflow!");
+      break;
+    }
+    txBuf[txWritePos] = s[i];                          // push it to the ring buffer
+    txWritePos = (txWritePos + 1) % BLE_BUF_SZ;      
+  }  
+  bleNotify();
+}
+
+// notify BLE client (send next packet from FIFO)
+void bleNotify() {  
+  if (txReadPos == txWritePos) return;
+  notifyData = "";
+  while ((txReadPos != txWritePos) && (notifyData.length() < BLE_MTU-5)) {
+    char ch = txBuf[txReadPos];
+    notifyData += ch;
+    txReadPos = (txReadPos + 1) % BLE_BUF_SZ;
+  }  
+  if (notifyData.length() > 0){    
+    pCharacteristic->setValue( (uint8_t*) notifyData.c_str(), notifyData.length() );
+    pCharacteristic->notify();         
+  }
+}
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param ) {
+      Serial.println("---------BLE client connected---------");
+      bleConnected = true;
+    };
+    void onDisconnect(BLEServer* pServer) {
+      bleConnected = false;
+      Serial.println("---------BLE client disconnected---------");
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    virtual void onStatus(BLECharacteristic* pCharacteristic, Status s, int code){
+      //CONSOLE.println("onStatus");            
+      if (s == BLECharacteristicCallbacks::Status::SUCCESS_NOTIFY) {
+        //CONSOLE.println("SUCCESS_NOTIFY");
+        // notify success => send next BLE packet...        
+        bleNotify();
+      }
+    }
+
+    void onStatus(BLECharacteristic* pCharacteristic, BLECharacteristicCallbacks::Status s, uint32_t code) {
+      //CONSOLE.println("onStatus");      
+      if (s == BLECharacteristicCallbacks::Status::SUCCESS_NOTIFY) {
+        //CONSOLE.println("SUCCESS_NOTIFY");
+        // notify success => send next BLE packet...        
+        bleNotify();
+      }
+    }
+
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      std::string value = pCharacteristic->getValue();
+
+      if (value.length() > 0) {
+        for (int i = 0; i < value.length(); i++)
+        {
+          Serial2.print(value[i]);
+        }
+    
+        DebugPrintHex("BLE rx", value.c_str());
+      }
+    }
+
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200);
+
+  Serial.println();
+  Serial.print("BLE NAME: ");
+  Serial.println(BLE_NAME);
+  Serial.println("waiting...");
+  Serial.println();
+
+  BLEDevice::init(BLE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                                         CHARACTERISTIC_UUID,
+                                         BLECharacteristic::PROPERTY_READ |
+                                         BLECharacteristic::PROPERTY_WRITE |
+                                         BLECharacteristic::PROPERTY_NOTIFY
+                                       );
+
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->start();
+}
+
+
+void loop() {
+  delay(10);
+  
+  // disconnecting
+  if (!bleConnected && oldBleConnected) {
+    Serial.println("waiting for bluetooth stack to get things ready...");
+    delay(500); // give the bluetooth stack the chance to get things ready
+    pServer->startAdvertising(); // restart advertising
+    Serial.println("restart advertising");
+    oldBleConnected = false;
+  }
+  // connecting
+  if (bleConnected && !oldBleConnected) {
+    // do stuff here on connecting
+    oldBleConnected = true;
+    Serial.println("BLE connected");
+  }
+
+  String s = "";
+  while (Serial2.available()) {
+    s += Serial2.read();
+  }
+  if (s.length() > 0) {
+    bleSend(s);
+  }
+}
